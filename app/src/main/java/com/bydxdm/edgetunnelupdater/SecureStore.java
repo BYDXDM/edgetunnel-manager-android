@@ -26,10 +26,11 @@ public final class SecureStore {
 
     public static void saveToken(Context context, String token) throws Exception {
         SecretKey key = getOrCreateKey();
-        byte[] iv = new byte[12];
-        new java.security.SecureRandom().nextBytes(iv);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+        // Keystore 密钥默认要求随机化加密：加密时不能传入调用方生成的 IV，
+        // 否则 init 会抛 InvalidAlgorithmParameterException，IV 必须取自 cipher 本身。
+        cipher.init(Cipher.ENCRYPT_MODE, key);
+        byte[] iv = cipher.getIV();
         byte[] encrypted = cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
         String packed = Base64.encodeToString(iv, Base64.NO_WRAP) + "."
                 + Base64.encodeToString(encrypted, Base64.NO_WRAP);

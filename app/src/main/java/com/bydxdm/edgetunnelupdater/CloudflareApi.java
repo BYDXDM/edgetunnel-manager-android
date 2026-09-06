@@ -236,17 +236,18 @@ public final class CloudflareApi {
             if (status < 200 || status >= 300) {
                 throw new IOException("下载 EdgeTunnel 源码失败：HTTP " + status);
             }
-            ZipInputStream zip = new ZipInputStream(connection.getInputStream());
             byte[] worker = null;
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null) {
-                String name = entry.getName().replace('\\', '/');
-                if (!entry.isDirectory() && (name.equals("_worker.js") || name.endsWith("/_worker.js"))) {
-                    worker = readAll(zip);
-                    break;
+            try (ZipInputStream zip = new ZipInputStream(connection.getInputStream())) {
+                ZipEntry entry;
+                while ((entry = zip.getNextEntry()) != null) {
+                    String name = entry.getName().replace('\\', '/');
+                    if (!entry.isDirectory()
+                            && (name.equals("_worker.js") || name.endsWith("/_worker.js"))) {
+                        worker = readAll(zip);
+                        break;
+                    }
                 }
             }
-            zip.close();
             if (worker == null || worker.length < 1000) {
                 throw new IOException("源码压缩包中没有找到有效的 _worker.js");
             }

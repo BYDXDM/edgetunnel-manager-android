@@ -52,13 +52,19 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        executor = Executors.newSingleThreadExecutor();
+        executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "edgetunnel-updater");
+            thread.setDaemon(true);
+            return thread;
+        });
         buildUi();
     }
 
     @Override
     protected void onDestroy() {
-        if (executor != null) executor.shutdownNow();
+        // 优雅关闭而不是 shutdownNow：旋转屏幕等导致的销毁不应中断
+        // 正在进行的 Cloudflare 部署，否则更新会在中途被打断且没有结果反馈。
+        if (executor != null) executor.shutdown();
         super.onDestroy();
     }
 
@@ -392,8 +398,10 @@ public class MainActivity extends Activity {
             String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
             String old = statusView == null ? "" : statusView.getText().toString();
             if (old.startsWith("状态日志\n")) old = old.substring("状态日志\n".length());
+            if (old.equals("等待操作。")) old = "";
             if (statusView != null) {
-                statusView.setText("状态日志\n" + old + "\n[" + time + "] " + message);
+                statusView.setText("状态日志\n" + (old.isEmpty() ? "" : old + "\n")
+                        + "[" + time + "] " + message);
             }
         });
     }
