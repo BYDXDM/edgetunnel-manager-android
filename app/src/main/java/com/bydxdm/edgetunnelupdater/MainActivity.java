@@ -153,7 +153,7 @@ public class MainActivity extends Activity {
         createKvCheck.setTextSize(13);
         content.addView(createKvCheck, margin(0, 2, 0, 12));
 
-        TextView source = text("源码来源：github.com/cmliu/edgetunnel（每次更新都重新下载 main.zip，只提取 _worker.js）", 12,
+        TextView source = text("源码来源：github.com/cmliu/edgetunnel（多镜像自动回退，按内容特征校验，只部署 _worker.js）", 12,
                 Color.GRAY);
         content.addView(source, margin(0, 0, 0, 12));
 
@@ -214,26 +214,75 @@ public class MainActivity extends Activity {
                 report.append("\nPages 项目：").append(pages.length())
                         .append("\nWorkers Script：").append(workers.length())
                         .append("\nKV 命名空间：").append(kv.length());
-                String suggestedPage = "";
+
+                // 自动检测：Workers 按脚本内容指纹，Pages 按 GitHub 来源 + 在线页面特征
+                appendStatus("正在检测账户中的 EdgeTunnel 部署……");
+                java.util.List<String> detectedWorkers = new java.util.ArrayList<>();
+                for (int i = 0; i < workers.length(); i++) {
+                    JSONObject item = workers.optJSONObject(i);
+                    if (item == null) continue;
+                    String name = item.optString("id");
+                    if (name.isEmpty()) name = item.optString("name");
+                    if (name.isEmpty()) continue;
+                    appendStatus("正在检查 Workers 脚本 " + (i + 1) + "/" + workers.length() + "：" + name);
+                    try {
+                        if (CloudflareApi.looksLikeEdgeTunnel(
+                                CloudflareApi.fetchScriptContent(accountId, name, token))) {
+                            detectedWorkers.add(name);
+                        }
+                    } catch (Exception ignore) {
+                        // 单个脚本读取失败不阻断检测
+                    }
+                }
+                java.util.List<String> detectedPages = new java.util.ArrayList<>();
                 for (int i = 0; i < pages.length(); i++) {
+                    JSONObject item = pages.optJSONObject(i);
+                    if (item == null) continue;
+                    String name = item.optString("name");
+                    if (name.isEmpty()) continue;
+                    JSONObject source = item.optJSONObject("source");
+                    JSONObject sourceMeta = source == null ? null : source.optJSONObject("metadata");
+                    String repo = sourceMeta == null ? "" : sourceMeta.optString("repo");
+                    if (repo.toLowerCase(Locale.ROOT).contains("edgetunnel")) {
+                        detectedPages.add(name); // GitHub 连接项目，部署来源即可信特征
+                        continue;
+                    }
+                    String subdomain = item.optString("subdomain");
+                    if (!subdomain.isEmpty()) {
+                        try {
+                            if (CloudflareApi.probePagesSite(subdomain)) detectedPages.add(name);
+                        } catch (Exception ignore) {
+                            // 在线探测失败不阻断检测
+                        }
+                    }
+                }
+                if (!detectedWorkers.isEmpty()) {
+                    report.append("\n检测到 EdgeTunnel Workers：")
+                            .append(android.text.TextUtils.join(", ", detectedWorkers));
+                }
+                if (!detectedPages.isEmpty()) {
+                    report.append("\n检测到 EdgeTunnel Pages：")
+                            .append(android.text.TextUtils.join(", ", detectedPages));
+                }
+
+                String suggestedPage = pickDetected(detectedPages);
+                for (int i = 0; suggestedPage.isEmpty() && i < pages.length(); i++) {
                     JSONObject item = pages.optJSONObject(i);
                     if (item != null && "edgetunnel".equalsIgnoreCase(item.optString("name"))) {
                         suggestedPage = item.optString("name");
-                        break;
                     }
                 }
                 if (suggestedPage.isEmpty() && pages.length() > 0) {
                     JSONObject item = pages.optJSONObject(0);
                     if (item != null) suggestedPage = item.optString("name");
                 }
-                String suggestedWorker = "";
-                for (int i = 0; i < workers.length(); i++) {
+                String suggestedWorker = pickDetected(detectedWorkers);
+                for (int i = 0; suggestedWorker.isEmpty() && i < workers.length(); i++) {
                     JSONObject item = workers.optJSONObject(i);
                     String name = item == null ? "" : item.optString("id");
                     if (name.isEmpty() && item != null) name = item.optString("name");
                     if ("edgetunnel".equalsIgnoreCase(name)) {
                         suggestedWorker = name;
-                        break;
                     }
                 }
                 if (suggestedWorker.isEmpty() && workers.length() > 0) {
@@ -263,6 +312,14 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> setBusy(false));
             }
         });
+    }
+
+    /** 检测结果中优先取名为 edgetunnel 的目标，否则取第一个。 */
+    private static String pickDetected(java.util.List<String> detected) {
+        for (String name : detected) {
+            if ("edgetunnel".equalsIgnoreCase(name)) return name;
+        }
+        return detected.isEmpty() ? "" : detected.get(0);
     }
 
     private void confirmUpdate() {
@@ -332,10 +389,23 @@ public class MainActivity extends Activity {
                         accountId, token, kvId, kvTitle);
                 appendStatus("KV：" + namespace.title + "（" + namespace.id + "）");
 
+                // 兼容性保留：沿用现有脚本的 compatibility_date/flags，读不到才用当天日期
+                String compatDate = "";
+                org.json.JSONArray compatFlags = null;
+                JSONObject settings = CloudflareApi.getWorkerSettings(accountId, script, token);
+                if (settings != null && !settings.optString("compatibility_date").isEmpty()) {
+                    compatDate = settings.optString("compatibility_date");
+                    compatFlags = settings.optJSONArray("compatibility_flags");
+                    appendStatus("沿用现有 compatibility_date：" + compatDate);
+                } else {
+                    compatDate = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+                    appendStatus("未读到现有脚本设置，使用当天 compatibility_date：" + compatDate);
+                }
+
                 if (workers) {
                     appendStatus("正在更新 Workers Script：" + script + "……");
                     CloudflareApi.deployWorker(accountId, script, token, source.script,
-                            namespace.id, admin);
+                            namespace.id, admin, compatDate, compatFlags);
                     appendStatus("Workers 更新请求已成功提交。");
                 }
 
@@ -346,7 +416,7 @@ public class MainActivity extends Activity {
                     CloudflareApi.configurePages(accountId, project, token, namespace.id, admin);
                     appendStatus("正在部署 Pages Worker……");
                     JSONObject deployment = CloudflareApi.deployPages(accountId, project, token,
-                            source.script, namespace.id);
+                            source.script, namespace.id, compatDate, compatFlags);
                     String deploymentId = deployment.optString("id");
                     String submittedUrl = deployment.optString("url");
                     if (!submittedUrl.isEmpty()) appendStatus("Pages 部署地址：" + submittedUrl);

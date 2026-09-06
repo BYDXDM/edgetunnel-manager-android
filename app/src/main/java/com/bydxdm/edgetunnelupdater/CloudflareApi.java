@@ -9,10 +9,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -31,8 +39,16 @@ public final class CloudflareApi {
             .readTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
             .writeTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
             .build();
-    public static final String EDGE_TUNNEL_ZIP =
-            "https://github.com/cmliu/edgetunnel/archive/refs/heads/main.zip";
+    /** 上游源码多镜像源，按优先级依次回退；全部失败时汇总各源错误。 */
+    public static final String[] SOURCE_URLS = {
+            "https://codeload.github.com/cmliu/edgetunnel/zip/refs/heads/main",
+            "https://codeload.github.com/cmliu/edgetunnel/zip/refs/heads/master",
+            "https://github.com/cmliu/edgetunnel/archive/refs/heads/main.zip",
+            "https://raw.githubusercontent.com/cmliu/edgetunnel/main/_worker.js",
+            "https://cdn.jsdelivr.net/gh/cmliu/edgetunnel@main/_worker.js",
+    };
+    private static final Set<String> TRUSTED_SOURCE_HOSTS = new HashSet<>(Arrays.asList(
+            "codeload.github.com", "github.com", "raw.githubusercontent.com", "cdn.jsdelivr.net"));
     private static final String USER_AGENT = "EdgeTunnel-Updater/1.0 (Android)";
 
     private CloudflareApi() {
@@ -165,9 +181,11 @@ public final class CloudflareApi {
 
     /** Deploys an advanced-mode Pages Worker bundle from the upstream _worker.js. */
     public static JSONObject deployPages(String accountId, String projectName, String token,
-                                         byte[] script, String kvId) throws Exception {
+                                         byte[] script, String kvId, String compatDate,
+                                         org.json.JSONArray compatFlags) throws Exception {
         String nestedBoundary = "----EdgeTunnelWorker" + UUID.randomUUID().toString().replace("-", "");
-        byte[] workerBundle = buildWorkerBundle(script, kvId, nestedBoundary, false);
+        byte[] workerBundle = buildWorkerBundle(script, kvId, nestedBoundary, false,
+                compatDate, compatFlags);
         String outerBoundary = "----EdgeTunnelDeploy" + UUID.randomUUID().toString().replace("-", "");
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         addTextPart(body, outerBoundary, "manifest", "{}", "application/json");
@@ -182,9 +200,10 @@ public final class CloudflareApi {
 
     /** Uploads the module Worker, preserving unrelated existing bindings. */
     public static void deployWorker(String accountId, String scriptName, String token,
-                                    byte[] script, String kvId, String adminPassword) throws Exception {
+                                    byte[] script, String kvId, String adminPassword,
+                                    String compatDate, org.json.JSONArray compatFlags) throws Exception {
         String boundary = "----EdgeTunnelWorker" + UUID.randomUUID().toString().replace("-", "");
-        byte[] form = buildWorkerBundle(script, kvId, boundary, true);
+        byte[] form = buildWorkerBundle(script, kvId, boundary, true, compatDate, compatFlags);
         requestJsonBytes("PUT", "/accounts/" + path(accountId) + "/workers/scripts/"
                 + path(scriptName), token, form, "multipart/form-data; boundary=" + boundary);
         JSONObject secret = new JSONObject().put("name", "ADMIN")
@@ -222,19 +241,146 @@ public final class CloudflareApi {
         return response.optJSONObject("result") == null ? response : response.optJSONObject("result");
     }
 
-    /** Downloads the current upstream archive and extracts only its _worker.js. */
+    /** 读取现有 Workers 脚本的兼容性设置（compatibility_date / flags）；读取失败返回 null。 */
+    public static JSONObject getWorkerSettings(String accountId, String scriptName,
+                                               String token) {
+        try {
+            JSONObject response = requestJson("GET", "/accounts/" + path(accountId)
+                    + "/workers/scripts/" + path(scriptName) + "/settings", token, null);
+            return response.optJSONObject("result");
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
+    /** 读取 Workers 脚本源码原文（该端点不返回 v4 信封）。 */
+    public static String fetchScriptContent(String accountId, String scriptName,
+                                            String token) throws Exception {
+        Request request = new Request.Builder()
+                .url(API + "/accounts/" + path(accountId) + "/workers/scripts/" + path(scriptName))
+                .header("Authorization", "Bearer " + token)
+                .header("User-Agent", USER_AGENT)
+                .build();
+        try (Response response = HTTP_CLIENT.newCall(request).execute()) {
+            String text = response.body() == null ? "" : response.body().string();
+            if (response.code() != 200) {
+                throw new CloudflareException("读取脚本失败（HTTP " + response.code() + "）",
+                        response.code(), text);
+            }
+            return text;
+        }
+    }
+
+    /** 在线探测 pages.dev 站点是否运行 EdgeTunnel：依次检查 /login 与 / 的页面特征。 */
+    public static boolean probePagesSite(String baseUrl) throws Exception {
+        String normalized = baseUrl.trim();
+        if (!normalized.startsWith("http")) normalized = "https://" + normalized;
+        URL url = new URL(normalized);
+        if (!"https".equalsIgnoreCase(url.getProtocol())) return false;
+        String host = url.getHost();
+        if (host == null || !(host.equals("pages.dev") || host.endsWith(".pages.dev"))) return false;
+        assertPublicHttpsHost(url, null);
+            for (String pathName : new String[]{"/login", "/"}) {
+                HttpURLConnection connection = null;
+                try {
+                    connection = openGet(new URL("https", host, url.getPort(), pathName));
+                    int status = connection.getResponseCode();
+                    // 不限定状态码：未设 ADMIN 的部署会以 404 返回同样带署名的页面
+                    InputStream stream = status >= 200 && status < 400
+                            ? connection.getInputStream() : connection.getErrorStream();
+                    if (stream != null) {
+                        String body = new String(readAll(stream), StandardCharsets.UTF_8);
+                        if (looksLikeEdgeTunnel(body)) return true;
+                    }
+                } catch (IOException ignore) {
+                    // 单个路径探测失败不影响整体结论
+                } finally {
+                    if (connection != null) connection.disconnect();
+                }
+            }
+            return false;
+    }
+
+    /** EdgeTunnel 内容特征：兼容老版本明文署名与新版本混淆后的中文变量名。 */
+    public static boolean looksLikeEdgeTunnel(String text) {
+        if (text == null || text.isEmpty()) return false;
+        String low = text.toLowerCase(Locale.ROOT);
+        if (low.contains("edgetunnel")) return true; // 老版本明文署名 / 面板页脚
+        if (low.contains("edt-pages.github.io")) return true; // 新版静态面板地址
+        if (text.contains("Pages静态页面") && text.contains("特征码字典")) return true;
+        if (text.contains("SOCKS5白名单") && text.contains("特征码字典")) return true;
+        return false;
+    }
+
+    /** 仅允许 https、白名单主机（allowedHosts 为 null 表示不限制主机名），且解析结果不得为内网/保留地址。 */
+    private static void assertPublicHttpsHost(URL url, Set<String> allowedHosts) throws IOException {
+        if (!"https".equalsIgnoreCase(url.getProtocol())) {
+            throw new IOException("仅允许 https 请求：" + url);
+        }
+        String host = url.getHost();
+        if (host == null || host.isEmpty()) throw new IOException("URL 缺少主机名");
+        if (allowedHosts != null && !allowedHosts.contains(host)) {
+            throw new IOException("主机不在白名单内：" + host);
+        }
+        InetAddress[] addresses;
+        try {
+            addresses = InetAddress.getAllByName(host);
+        } catch (IOException error) {
+            throw new IOException("域名解析失败：" + host);
+        }
+        for (InetAddress addr : addresses) {
+            boolean reserved = addr.isLoopbackAddress() || addr.isSiteLocalAddress()
+                    || addr.isLinkLocalAddress() || addr.isAnyLocalAddress()
+                    || addr.isMulticastAddress();
+            if (addr instanceof Inet4Address) {
+                int o0 = addr.getAddress()[0] & 0xFF;
+                int o1 = addr.getAddress()[1] & 0xFF;
+                if (o0 == 0 || o0 == 100 && o1 >= 64 && o1 <= 127 || o0 >= 240
+                        || o0 == 198 && o1 >= 18 && o1 <= 19) {
+                    reserved = true; // 0/8、CGNAT、广播段、基准测试段
+                }
+            }
+            if (addr instanceof Inet6Address) {
+                byte[] bytes = addr.getAddress();
+                if (bytes.length > 0 && (bytes[0] & 0xFE) == 0xFC) {
+                    reserved = true; // fc00::/7 唯一本地地址
+                }
+            }
+            if (reserved) {
+                throw new IOException("主机解析到内网/保留地址，已拒绝：" + host);
+            }
+        }
+    }
+
+    /** 依次尝试多镜像源下载 _worker.js，任一源成功且通过特征校验即返回。 */
     public static SourceWorker downloadLatestWorker() throws Exception {
+        StringBuilder attempts = new StringBuilder();
+        for (String spec : SOURCE_URLS) {
+            try {
+                URL url = new URL(spec);
+                assertPublicHttpsHost(url, TRUSTED_SOURCE_HOSTS);
+                byte[] worker = spec.endsWith(".zip") || spec.contains("/zip/")
+                        ? fetchZipWorker(url) : fetchRawWorker(url);
+                String text = new String(worker, StandardCharsets.UTF_8);
+                if (!looksLikeEdgeTunnel(text)) {
+                    throw new IOException("内容未通过 EdgeTunnel 特征校验");
+                }
+                return new SourceWorker(worker, extractVersion(text));
+            } catch (Exception error) {
+                if (attempts.length() > 0) attempts.append("\n");
+                attempts.append(spec).append("：").append(error.getMessage());
+            }
+        }
+        throw new IOException("所有源码源均不可用：\n" + attempts);
+    }
+
+    private static byte[] fetchZipWorker(URL url) throws Exception {
         HttpURLConnection connection = null;
         try {
-            connection = (HttpURLConnection) new URL(EDGE_TUNNEL_ZIP).openConnection();
-            connection.setRequestMethod("GET");
-            connection.setConnectTimeout(30000);
-            connection.setReadTimeout(120000);
-            connection.setInstanceFollowRedirects(true);
-            connection.setRequestProperty("User-Agent", USER_AGENT);
+            connection = openGet(url);
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) {
-                throw new IOException("下载 EdgeTunnel 源码失败：HTTP " + status);
+                throw new IOException("HTTP " + status);
             }
             byte[] worker = null;
             try (ZipInputStream zip = new ZipInputStream(connection.getInputStream())) {
@@ -251,33 +397,68 @@ public final class CloudflareApi {
             if (worker == null || worker.length < 1000) {
                 throw new IOException("源码压缩包中没有找到有效的 _worker.js");
             }
-            String text = new String(worker, StandardCharsets.UTF_8);
-            if (!text.contains("export default") || !text.contains("async fetch")) {
-                throw new IOException("下载到的 _worker.js 不是可识别的 EdgeTunnel Worker");
-            }
-            String version = "未知版本";
-            int marker = text.indexOf("const Version");
-            if (marker >= 0) {
-                int firstQuote = text.indexOf('"', marker);
-                if (firstQuote < 0) firstQuote = text.indexOf('\'', marker);
-                if (firstQuote >= 0) {
-                    char quote = text.charAt(firstQuote);
-                    int endQuote = text.indexOf(quote, firstQuote + 1);
-                    if (endQuote > firstQuote) version = text.substring(firstQuote + 1, endQuote);
-                }
-            }
-            return new SourceWorker(worker, version);
+            return worker;
         } finally {
             if (connection != null) connection.disconnect();
         }
     }
 
+    private static byte[] fetchRawWorker(URL url) throws Exception {
+        HttpURLConnection connection = null;
+        try {
+            connection = openGet(url);
+            int status = connection.getResponseCode();
+            if (status < 200 || status >= 300) {
+                throw new IOException("HTTP " + status);
+            }
+            byte[] worker = readAll(connection.getInputStream());
+            if (worker.length < 1000) {
+                throw new IOException("_worker.js 内容过短");
+            }
+            return worker;
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private static HttpURLConnection openGet(URL url) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(30000);
+        connection.setReadTimeout(120000);
+        connection.setInstanceFollowRedirects(true);
+        connection.setRequestProperty("User-Agent", USER_AGENT);
+        return connection;
+    }
+
+    private static String extractVersion(String text) {
+        int marker = text.indexOf("const Version");
+        if (marker >= 0) {
+            int firstQuote = text.indexOf('"', marker);
+            if (firstQuote < 0) firstQuote = text.indexOf('\'', marker);
+            if (firstQuote >= 0) {
+                char quote = text.charAt(firstQuote);
+                int endQuote = text.indexOf(quote, firstQuote + 1);
+                if (endQuote > firstQuote) return text.substring(firstQuote + 1, endQuote);
+            }
+        }
+        return "未知版本";
+    }
+
     private static byte[] buildWorkerBundle(byte[] script, String kvId, String boundary,
-                                             boolean preserveExistingBindings)
+                                             boolean preserveExistingBindings,
+                                             String compatDate, org.json.JSONArray compatFlags)
             throws IOException, JSONException {
+        // 沿用现有脚本的兼容性设置；无法读取时才落到当天日期，避免覆盖用户配置。
+        String resolvedDate = compatDate == null || compatDate.trim().isEmpty()
+                ? new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date())
+                : compatDate.trim();
         JSONObject metadata = new JSONObject()
                 .put("main_module", "_worker.js")
-                .put("compatibility_date", "2025-11-04");
+                .put("compatibility_date", resolvedDate);
+        if (compatFlags != null && compatFlags.length() > 0) {
+            metadata.put("compatibility_flags", compatFlags);
+        }
         if (preserveExistingBindings) {
             metadata.put("keep_bindings", new JSONArray()
                     .put("plain_text").put("json").put("secret_text")

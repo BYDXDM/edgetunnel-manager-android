@@ -4,8 +4,9 @@
 
 ## 功能
 
-- 从上游 `main.zip` 下载最新 `_worker.js`
-- 更新 Cloudflare Workers Script
+- 多镜像源下载最新 `_worker.js`（codeload → github archive → raw → jsdelivr 自动回退），并按内容特征校验
+- 自动检测账户中的 EdgeTunnel 部署（Workers 内容指纹、Pages 部署来源与在线页面特征），自动回填目标
+- 更新 Cloudflare Workers Script（沿用现有 `compatibility_date` / `compatibility_flags`，不覆盖兼容性配置）
 - 更新 Cloudflare Pages 项目（Advanced Mode Worker）
 - Pages / Workers 可单独选择，也可以同时更新
 - 自动复用同名 KV Namespace，或按确认后创建新的 KV Namespace
