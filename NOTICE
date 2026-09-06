@@ -1,0 +1,8 @@
+EdgeTunnel Updater is an independent Android management client.
+
+It downloads the EdgeTunnel source from:
+https://github.com/cmliu/edgetunnel
+
+The upstream EdgeTunnel repository is licensed under GPL-2.0. This repository
+links to the upstream source and does not include a copy of the upstream
+worker script. See the upstream repository for its complete license and source.

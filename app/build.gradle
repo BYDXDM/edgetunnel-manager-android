@@ -1,0 +1,45 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.bydxdm.edgetunnelupdater"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.bydxdm.edgetunnelupdater"
+        minSdk 23
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+    }
+
+    signingConfigs {
+        ciRelease {
+            if (project.hasProperty("releaseStoreFile")) {
+                storeFile file(project.property("releaseStoreFile"))
+                storePassword project.property("releaseStorePassword")
+                keyAlias project.property("releaseKeyAlias")
+                keyPassword project.property("releaseKeyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig project.hasProperty("releaseStoreFile")
+                    ? signingConfigs.ciRelease
+                    : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+}
