@@ -22,11 +22,11 @@
    - Workers Scripts: Edit
    - Workers KV Storage: Edit
    - Pages: Edit
-3. 打开 APK，填写 Token，点击“读取账户并检查 API”。
-4. 填写 Account ID、Pages 项目名或 Workers Script 名称。
-5. 填写 EdgeTunnel 的 `ADMIN` 管理密码。
-6. 已有 KV 可填 Namespace ID；留空并勾选自动创建时，程序会复用同名 `EDT-KV`，找不到才创建。
-7. 点击“更新 EdgeTunnel”，确认后执行部署。
+3. 打开 APK，只需两步：
+   - 粘贴 **API Token**，填写 EdgeTunnel 的 `ADMIN` 管理密码
+   - 点击 **检测并更新**，确认检测到的部署目标后执行
+
+程序会自动读取账户、识别现有的 EdgeTunnel 部署（Pages / Workers）、复用或创建 `EDT-KV`，全程无需手动填写项目名。首次部署（账户里还没有 EdgeTunnel）时，展开 **高级设置** 填写 Pages 项目名 / Workers Script 名即可；部署目标、Account ID、KV ID 也都在高级设置中。
 
 ## 安全说明
 

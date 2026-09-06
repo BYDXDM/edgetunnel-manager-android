@@ -3,8 +3,11 @@ package com.bydxdm.edgetunnelupdater;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -12,7 +15,6 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -21,7 +23,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -29,25 +33,36 @@ import java.util.concurrent.Executors;
 /**
  * The app deliberately talks directly to Cloudflare. No token, password, or
  * deployment data is sent to an intermediary service.
+ *
+ * 极简界面：默认只需 Token + ADMIN 密码 + 一个按钮；项目名、Script 名、
+ * Account ID、KV 全部留空时自动检测/复用/创建。高级选项折叠收起。
  */
 public class MainActivity extends Activity {
     private EditText tokenInput;
+    private EditText adminInput;
     private EditText accountInput;
     private EditText pagesProjectInput;
     private EditText workerScriptInput;
-    private EditText adminInput;
     private EditText kvIdInput;
     private EditText kvTitleInput;
     private CheckBox pagesCheck;
     private CheckBox workersCheck;
     private CheckBox saveTokenCheck;
-    private CheckBox createKvCheck;
-    private Button checkButton;
+    private LinearLayout advancedPanel;
+    private TextView advancedToggle;
     private Button updateButton;
+    private Button detectOnlyButton;
     private Button clearTokenButton;
-    private ProgressBar progressBar;
     private TextView statusView;
     private ExecutorService executor;
+
+    /** 一次检测的结果：账户 + 统计 + 建议目标 + 报告文本。 */
+    private static class Detection {
+        String accountId = "";
+        String suggestedPages = "";
+        String suggestedWorker = "";
+        String report = "";
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,242 +83,163 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    private void buildUi() {
-        int pad = dp(18);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, dp(12), pad, dp(8));
-        root.setBackgroundColor(Color.rgb(245, 248, 252));
+    // ------------------------------------------------------------------ UI
 
+    private void buildUi() {
         ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.rgb(245, 248, 252));
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(16), dp(16), dp(16), dp(20));
         scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        setContentView(scroll);
 
-        TextView title = text("EdgeTunnel 更新器", 24, Color.rgb(13, 71, 161));
-        title.setTypeface(null, android.graphics.Typeface.BOLD);
-        content.addView(title, margin(0, 4, 0, 2));
-        content.addView(text("从 cmliu/edgetunnel 下载最新 _worker.js，直接部署到 Cloudflare Pages / Workers。", 14,
-                Color.DKGRAY), margin(0, 0, 0, 12));
+        TextView title = text("EdgeTunnel 更新器", 22, Color.rgb(13, 71, 161));
+        title.setTypeface(null, Typeface.BOLD);
+        content.addView(title, margin(0, 0, 0, 2));
+        content.addView(text("填 Token 和管理密码，一键把最新 _worker.js 部署到 Cloudflare。", 13, Color.DKGRAY),
+                margin(0, 0, 0, 14));
 
-        TextView warning = text("Token 仅在本机 Android Keystore 中加密保存；更新前会显示确认框。请只使用你自己账号的 Cloudflare API Token。", 13,
-                Color.rgb(92, 64, 12));
-        warning.setBackgroundColor(Color.rgb(255, 243, 205));
-        warning.setPadding(dp(10), dp(8), dp(10), dp(8));
-        content.addView(warning, margin(0, 0, 0, 14));
-
-        tokenInput = field("Cloudflare API Token", true);
+        // ---- 第一步：两个必填项 ----
+        LinearLayout card = card();
+        card.addView(label("① Cloudflare API Token"), margin(0, 0, 0, 4));
+        tokenInput = passwordField("粘贴 API Token");
         tokenInput.setText(SecureStore.readToken(this));
-        content.addView(tokenInput);
-        content.addView(text("建议权限：Account Read、Workers Scripts Edit、Workers KV Storage Edit、Pages Edit。", 12,
-                Color.GRAY), margin(0, 3, 0, 8));
+        card.addView(tokenInput, margin(0, 0, 0, 12));
 
-        LinearLayout tokenButtons = row();
+        card.addView(label("② EdgeTunnel 管理密码（ADMIN）"), margin(0, 0, 0, 4));
+        adminInput = passwordField("用于登录 /admin 面板");
+        card.addView(adminInput, margin(0, 0, 0, 0));
+        content.addView(card, margin(0, 0, 0, 14));
+
+        // ---- 主按钮 ----
+        updateButton = primaryButton("检测并更新");
+        updateButton.setOnClickListener(v -> startFlow(false));
+        content.addView(updateButton, margin(0, 0, 0, 6));
+
+        advancedToggle = text("高级设置 ▸", 13, Color.rgb(21, 101, 192));
+        advancedToggle.setPadding(dp(6), dp(10), dp(6), dp(10));
+        advancedToggle.setOnClickListener(v -> toggleAdvanced());
+        content.addView(advancedToggle, margin(0, 0, 0, 4));
+
+        // ---- 高级设置（默认折叠）----
+        advancedPanel = card();
+        advancedPanel.setVisibility(View.GONE);
+
+        advancedPanel.addView(label("部署目标"), margin(0, 0, 0, 4));
+        LinearLayout targetRow = row();
+        pagesCheck = new CheckBox(this);
+        pagesCheck.setText("Pages");
+        pagesCheck.setChecked(true);
+        pagesCheck.setTextSize(14);
+        workersCheck = new CheckBox(this);
+        workersCheck.setText("Workers");
+        workersCheck.setChecked(true);
+        workersCheck.setTextSize(14);
+        targetRow.addView(pagesCheck, new LinearLayout.LayoutParams(0, -2, 1));
+        targetRow.addView(workersCheck, new LinearLayout.LayoutParams(0, -2, 1));
+        advancedPanel.addView(targetRow, margin(0, 0, 0, 10));
+
+        advancedPanel.addView(label("Account ID（留空自动读取）"), margin(0, 0, 0, 4));
+        accountInput = plainField("留空 = 使用 Token 可访问的账户");
+        advancedPanel.addView(accountInput, margin(0, 0, 0, 10));
+
+        advancedPanel.addView(label("Pages 项目名（留空自动检测）"), margin(0, 0, 0, 4));
+        pagesProjectInput = plainField("例如 edgetunnel");
+        advancedPanel.addView(pagesProjectInput, margin(0, 0, 0, 10));
+
+        advancedPanel.addView(label("Workers Script 名（留空自动检测）"), margin(0, 0, 0, 4));
+        workerScriptInput = plainField("例如 edgetunnel");
+        advancedPanel.addView(workerScriptInput, margin(0, 0, 0, 10));
+
+        advancedPanel.addView(label("KV Namespace（留空自动复用/创建）"), margin(0, 0, 0, 4));
+        kvIdInput = plainField("已有 KV ID，可选");
+        advancedPanel.addView(kvIdInput, margin(0, 0, 0, 6));
+        kvTitleInput = plainField("自动创建时的名称");
+        kvTitleInput.setText("EDT-KV");
+        advancedPanel.addView(kvTitleInput, margin(0, 0, 0, 10));
+
+        LinearLayout tokenRow = row();
         saveTokenCheck = new CheckBox(this);
-        saveTokenCheck.setText("保存 Token（Keystore）");
+        saveTokenCheck.setText("记住 Token（本机加密保存）");
         saveTokenCheck.setTextSize(13);
         saveTokenCheck.setChecked(!tokenInput.getText().toString().trim().isEmpty());
-        tokenButtons.addView(saveTokenCheck, new LinearLayout.LayoutParams(0, -2, 1));
-        clearTokenButton = button("清除已保存");
-        tokenButtons.addView(clearTokenButton, new LinearLayout.LayoutParams(-2, -2));
-        content.addView(tokenButtons, margin(0, 0, 0, 12));
+        tokenRow.addView(saveTokenCheck, new LinearLayout.LayoutParams(0, -2, 1));
+        clearTokenButton = ghostButton("清除");
         clearTokenButton.setOnClickListener(v -> {
             SecureStore.clearToken(this);
             tokenInput.setText("");
             saveTokenCheck.setChecked(false);
             appendStatus("已清除本机保存的 Token。");
         });
+        tokenRow.addView(clearTokenButton, new LinearLayout.LayoutParams(-2, -2));
+        advancedPanel.addView(tokenRow, margin(0, 0, 0, 10));
 
-        accountInput = field("Cloudflare Account ID（可点读取账户自动填入）", false);
-        content.addView(accountInput);
-        checkButton = button("读取账户并检查 API");
-        content.addView(checkButton, margin(0, 6, 0, 10));
-        checkButton.setOnClickListener(v -> checkApi());
+        detectOnlyButton = ghostButton("仅检测部署，不更新");
+        detectOnlyButton.setOnClickListener(v -> startFlow(true));
+        advancedPanel.addView(detectOnlyButton, margin(0, 0, 0, 0));
+        content.addView(advancedPanel, margin(0, 0, 0, 14));
 
-        content.addView(section("部署目标"));
-        LinearLayout targetRow = row();
-        pagesCheck = new CheckBox(this);
-        pagesCheck.setText("Pages");
-        pagesCheck.setChecked(true);
-        workersCheck = new CheckBox(this);
-        workersCheck.setText("Workers");
-        workersCheck.setChecked(true);
-        targetRow.addView(pagesCheck, new LinearLayout.LayoutParams(0, -2, 1));
-        targetRow.addView(workersCheck, new LinearLayout.LayoutParams(0, -2, 1));
-        content.addView(targetRow);
+        // ---- 状态日志 ----
+        LinearLayout logCard = card();
+        statusView = text("", 12, Color.rgb(35, 49, 66));
+        statusView.setText("等待操作。\n");
+        logCard.addView(statusView, new ViewGroup.LayoutParams(-1, -2));
+        content.addView(logCard, new LinearLayout.LayoutParams(-1, -2));
 
-        pagesProjectInput = field("Pages 项目名称（例如 edgetunnel）", false);
-        content.addView(pagesProjectInput);
-        workerScriptInput = field("Workers Script 名称（例如 edgetunnel）", false);
-        content.addView(workerScriptInput, margin(0, 6, 0, 0));
-
-        adminInput = field("EdgeTunnel ADMIN 管理密码（必填）", true);
-        content.addView(adminInput, margin(0, 12, 0, 0));
-
-        content.addView(section("KV 命名空间"));
-        kvIdInput = field("已有 KV Namespace ID（可留空自动复用/创建）", false);
-        content.addView(kvIdInput);
-        kvTitleInput = field("自动复用/创建时的 KV 名称", false);
-        kvTitleInput.setText("EDT-KV");
-        content.addView(kvTitleInput, margin(0, 6, 0, 0));
-        createKvCheck = new CheckBox(this);
-        createKvCheck.setText("KV ID 为空时自动复用同名或创建（推荐）");
-        createKvCheck.setChecked(true);
-        createKvCheck.setTextSize(13);
-        content.addView(createKvCheck, margin(0, 2, 0, 12));
-
-        TextView source = text("源码来源：github.com/cmliu/edgetunnel（多镜像自动回退，按内容特征校验，只部署 _worker.js）", 12,
-                Color.GRAY);
-        content.addView(source, margin(0, 0, 0, 12));
-
-        updateButton = button("更新 EdgeTunnel");
-        updateButton.setTextSize(16);
-        content.addView(updateButton, margin(0, 0, 0, 10));
-        updateButton.setOnClickListener(v -> confirmUpdate());
-
-        statusView = text("状态日志\n等待操作。", 13, Color.rgb(35, 49, 66));
-        statusView.setGravity(Gravity.TOP | Gravity.START);
-        statusView.setPadding(dp(10), dp(10), dp(10), dp(10));
-        statusView.setBackgroundColor(Color.WHITE);
-        content.addView(statusView, margin(0, 0, 0, 20));
-
-        progressBar = new ProgressBar(this);
-        progressBar.setVisibility(View.GONE);
-        root.addView(progressBar, new LinearLayout.LayoutParams(-2, -2) {{
-            gravity = Gravity.CENTER_HORIZONTAL;
-        }});
-        setContentView(root);
+        appendStatus("提示：项目名等留空会自动检测账户里的 EdgeTunnel 部署。");
     }
 
-    private void checkApi() {
+    private void toggleAdvanced() {
+        boolean show = advancedPanel.getVisibility() != View.VISIBLE;
+        advancedPanel.setVisibility(show ? View.VISIBLE : View.GONE);
+        advancedToggle.setText(show ? "高级设置 ▾" : "高级设置 ▸");
+    }
+
+    // -------------------------------------------------------- 主流程入口
+
+    /**
+     * @param detectOnly true=只检测并显示结果；false=检测后弹确认框再更新
+     */
+    private void startFlow(boolean detectOnly) {
         final String token = tokenInput.getText().toString().trim();
+        final String currentAccount = accountInput.getText().toString().trim();
         if (token.isEmpty()) {
             toast("请先填写 Cloudflare API Token");
             return;
         }
+        final boolean pages = pagesCheck.isChecked();
+        final boolean workers = workersCheck.isChecked();
+        if (!detectOnly && !pages && !workers) {
+            toast("至少选择 Pages 或 Workers（高级设置中）");
+            return;
+        }
+        final String admin = adminInput.getText().toString();
+        if (!detectOnly && admin.trim().isEmpty()) {
+            toast("请填写 EdgeTunnel 管理密码（ADMIN）");
+            return;
+        }
         rememberTokenIfRequested(token);
         setBusy(true);
-        appendStatus("正在读取 Cloudflare 账户……");
+        appendStatus("正在连接 Cloudflare 并检测部署……");
         executor.execute(() -> {
             try {
-                JSONArray accounts = CloudflareApi.listAccounts(token);
-                if (accounts.length() == 0) throw new Exception("Token 没有可访问的账户");
-                String currentAccount = accountInput.getText().toString().trim();
-                int selected = 0;
-                StringBuilder report = new StringBuilder("账户：\n");
-                for (int i = 0; i < accounts.length(); i++) {
-                    JSONObject account = accounts.optJSONObject(i);
-                    if (account == null) continue;
-                    String id = account.optString("id");
-                    String name = account.optString("name");
-                    report.append("• ").append(name).append("  ").append(id).append('\n');
-                    if (!currentAccount.isEmpty() && currentAccount.equals(id)) selected = i;
-                }
-                JSONObject first = accounts.optJSONObject(selected);
-                if (currentAccount.isEmpty() && first != null) {
-                    final String firstId = first.optString("id");
-                    runOnUiThread(() -> accountInput.setText(firstId));
-                    currentAccount = first == null ? "" : first.optString("id");
-                }
-                final String accountId = currentAccount.isEmpty() && first != null
-                        ? first.optString("id") : currentAccount;
-                JSONArray pages = CloudflareApi.listPagesProjects(accountId, token);
-                JSONArray workers = CloudflareApi.listWorkerScripts(accountId, token);
-                JSONArray kv = CloudflareApi.listKvNamespaces(accountId, token);
-                report.append("\nPages 项目：").append(pages.length())
-                        .append("\nWorkers Script：").append(workers.length())
-                        .append("\nKV 命名空间：").append(kv.length());
-
-                // 自动检测：Workers 按脚本内容指纹，Pages 按 GitHub 来源 + 在线页面特征
-                appendStatus("正在检测账户中的 EdgeTunnel 部署……");
-                java.util.List<String> detectedWorkers = new java.util.ArrayList<>();
-                for (int i = 0; i < workers.length(); i++) {
-                    JSONObject item = workers.optJSONObject(i);
-                    if (item == null) continue;
-                    String name = item.optString("id");
-                    if (name.isEmpty()) name = item.optString("name");
-                    if (name.isEmpty()) continue;
-                    appendStatus("正在检查 Workers 脚本 " + (i + 1) + "/" + workers.length() + "：" + name);
-                    try {
-                        if (CloudflareApi.looksLikeEdgeTunnel(
-                                CloudflareApi.fetchScriptContent(accountId, name, token))) {
-                            detectedWorkers.add(name);
-                        }
-                    } catch (Exception ignore) {
-                        // 单个脚本读取失败不阻断检测
-                    }
-                }
-                java.util.List<String> detectedPages = new java.util.ArrayList<>();
-                for (int i = 0; i < pages.length(); i++) {
-                    JSONObject item = pages.optJSONObject(i);
-                    if (item == null) continue;
-                    String name = item.optString("name");
-                    if (name.isEmpty()) continue;
-                    JSONObject source = item.optJSONObject("source");
-                    JSONObject sourceMeta = source == null ? null : source.optJSONObject("metadata");
-                    String repo = sourceMeta == null ? "" : sourceMeta.optString("repo");
-                    if (repo.toLowerCase(Locale.ROOT).contains("edgetunnel")) {
-                        detectedPages.add(name); // GitHub 连接项目，部署来源即可信特征
-                        continue;
-                    }
-                    String subdomain = item.optString("subdomain");
-                    if (!subdomain.isEmpty()) {
-                        try {
-                            if (CloudflareApi.probePagesSite(subdomain)) detectedPages.add(name);
-                        } catch (Exception ignore) {
-                            // 在线探测失败不阻断检测
-                        }
-                    }
-                }
-                if (!detectedWorkers.isEmpty()) {
-                    report.append("\n检测到 EdgeTunnel Workers：")
-                            .append(android.text.TextUtils.join(", ", detectedWorkers));
-                }
-                if (!detectedPages.isEmpty()) {
-                    report.append("\n检测到 EdgeTunnel Pages：")
-                            .append(android.text.TextUtils.join(", ", detectedPages));
-                }
-
-                String suggestedPage = pickDetected(detectedPages);
-                for (int i = 0; suggestedPage.isEmpty() && i < pages.length(); i++) {
-                    JSONObject item = pages.optJSONObject(i);
-                    if (item != null && "edgetunnel".equalsIgnoreCase(item.optString("name"))) {
-                        suggestedPage = item.optString("name");
-                    }
-                }
-                if (suggestedPage.isEmpty() && pages.length() > 0) {
-                    JSONObject item = pages.optJSONObject(0);
-                    if (item != null) suggestedPage = item.optString("name");
-                }
-                String suggestedWorker = pickDetected(detectedWorkers);
-                for (int i = 0; suggestedWorker.isEmpty() && i < workers.length(); i++) {
-                    JSONObject item = workers.optJSONObject(i);
-                    String name = item == null ? "" : item.optString("id");
-                    if (name.isEmpty() && item != null) name = item.optString("name");
-                    if ("edgetunnel".equalsIgnoreCase(name)) {
-                        suggestedWorker = name;
-                    }
-                }
-                if (suggestedWorker.isEmpty() && workers.length() > 0) {
-                    JSONObject item = workers.optJSONObject(0);
-                    if (item != null) {
-                        suggestedWorker = item.optString("id");
-                        if (suggestedWorker.isEmpty()) suggestedWorker = item.optString("name");
-                    }
-                }
-                final String result = report.toString();
-                final String pageSuggestion = suggestedPage;
-                final String workerSuggestion = suggestedWorker;
+                Detection d = detect(token, currentAccount);
                 runOnUiThread(() -> {
-                    appendStatus(result);
+                    accountInput.setText(d.accountId);
                     if (pagesProjectInput.getText().toString().trim().isEmpty()
-                            && !pageSuggestion.isEmpty()) {
-                        pagesProjectInput.setText(pageSuggestion);
+                            && !d.suggestedPages.isEmpty()) {
+                        pagesProjectInput.setText(d.suggestedPages);
                     }
                     if (workerScriptInput.getText().toString().trim().isEmpty()
-                            && !workerSuggestion.isEmpty()) {
-                        workerScriptInput.setText(workerSuggestion);
+                            && !d.suggestedWorker.isEmpty()) {
+                        workerScriptInput.setText(d.suggestedWorker);
+                    }
+                    appendStatus(d.report);
+                    if (detectOnly) {
+                        toast("检测完成");
+                    } else {
+                        confirmUpdate(d);
                     }
                 });
             } catch (Exception error) {
@@ -314,68 +250,162 @@ public class MainActivity extends Activity {
         });
     }
 
+    /** 后台执行：读账户 → 列资源 → 指纹检测 EdgeTunnel 部署 → 生成建议与报告。 */
+    private Detection detect(String token, String presetAccount) throws Exception {
+        JSONArray accounts = CloudflareApi.listAccounts(token);
+        if (accounts.length() == 0) throw new Exception("Token 没有可访问的账户");
+        String accountId = presetAccount;
+        if (accountId.isEmpty()) {
+            JSONObject first = accounts.optJSONObject(0);
+            accountId = first == null ? "" : first.optString("id");
+        }
+        JSONArray pages = CloudflareApi.listPagesProjects(accountId, token);
+        JSONArray workers = CloudflareApi.listWorkerScripts(accountId, token);
+        JSONArray kv = CloudflareApi.listKvNamespaces(accountId, token);
+
+        appendStatus("正在识别账户中的 EdgeTunnel 部署……");
+        List<String> detectedWorkers = new ArrayList<>();
+        for (int i = 0; i < workers.length(); i++) {
+            JSONObject item = workers.optJSONObject(i);
+            if (item == null) continue;
+            String name = item.optString("id");
+            if (name.isEmpty()) name = item.optString("name");
+            if (name.isEmpty()) continue;
+            appendStatus("正在检查 Workers 脚本 " + (i + 1) + "/" + workers.length() + "：" + name);
+            try {
+                if (CloudflareApi.looksLikeEdgeTunnel(
+                        CloudflareApi.fetchScriptContent(accountId, name, token))) {
+                    detectedWorkers.add(name);
+                }
+            } catch (Exception ignore) {
+                // 单个脚本读取失败不阻断检测
+            }
+        }
+        List<String> detectedPages = new ArrayList<>();
+        for (int i = 0; i < pages.length(); i++) {
+            JSONObject item = pages.optJSONObject(i);
+            if (item == null) continue;
+            String name = item.optString("name");
+            if (name.isEmpty()) continue;
+            JSONObject source = item.optJSONObject("source");
+            JSONObject sourceMeta = source == null ? null : source.optJSONObject("metadata");
+            String repo = sourceMeta == null ? "" : sourceMeta.optString("repo");
+            if (repo.toLowerCase(Locale.ROOT).contains("edgetunnel")) {
+                detectedPages.add(name); // GitHub 连接项目，部署来源即可信特征
+                continue;
+            }
+            String subdomain = item.optString("subdomain");
+            if (!subdomain.isEmpty()) {
+                try {
+                    if (CloudflareApi.probePagesSite(subdomain)) detectedPages.add(name);
+                } catch (Exception ignore) {
+                    // 在线探测失败不阻断检测
+                }
+            }
+        }
+
+        Detection d = new Detection();
+        d.accountId = accountId;
+        d.suggestedPages = pickDetected(detectedPages);
+        if (d.suggestedPages.isEmpty()) {
+            for (int i = 0; i < pages.length(); i++) {
+                JSONObject item = pages.optJSONObject(i);
+                if (item != null && "edgetunnel".equalsIgnoreCase(item.optString("name"))) {
+                    d.suggestedPages = item.optString("name");
+                    break;
+                }
+            }
+            if (d.suggestedPages.isEmpty() && pages.length() > 0) {
+                JSONObject item = pages.optJSONObject(0);
+                if (item != null) d.suggestedPages = item.optString("name");
+            }
+        }
+        d.suggestedWorker = pickDetected(detectedWorkers);
+        if (d.suggestedWorker.isEmpty()) {
+            for (int i = 0; i < workers.length(); i++) {
+                JSONObject item = workers.optJSONObject(i);
+                String name = item == null ? "" : item.optString("id");
+                if (name.isEmpty() && item != null) name = item.optString("name");
+                if ("edgetunnel".equalsIgnoreCase(name)) {
+                    d.suggestedWorker = name;
+                    break;
+                }
+            }
+            if (d.suggestedWorker.isEmpty() && workers.length() > 0) {
+                JSONObject item = workers.optJSONObject(0);
+                if (item != null) {
+                    d.suggestedWorker = item.optString("id");
+                    if (d.suggestedWorker.isEmpty()) d.suggestedWorker = item.optString("name");
+                }
+            }
+        }
+
+        StringBuilder report = new StringBuilder("账户：").append(accountId).append('\n')
+                .append("Pages 项目：").append(pages.length())
+                .append(" · Workers Script：").append(workers.length())
+                .append(" · KV：").append(kv.length());
+        if (!detectedPages.isEmpty()) {
+            report.append("\n检测到 EdgeTunnel Pages：")
+                    .append(TextUtils.join(", ", detectedPages));
+        }
+        if (!detectedWorkers.isEmpty()) {
+            report.append("\n检测到 EdgeTunnel Workers：")
+                    .append(TextUtils.join(", ", detectedWorkers));
+        }
+        if (detectedPages.isEmpty() && detectedWorkers.isEmpty()) {
+            report.append("\n未检测到现有 EdgeTunnel 部署；首次部署请在高级设置中填写名称。");
+        }
+        d.report = report.toString();
+        return d;
+    }
+
     /** 检测结果中优先取名为 edgetunnel 的目标，否则取第一个。 */
-    private static String pickDetected(java.util.List<String> detected) {
+    private static String pickDetected(List<String> detected) {
         for (String name : detected) {
             if ("edgetunnel".equalsIgnoreCase(name)) return name;
         }
         return detected.isEmpty() ? "" : detected.get(0);
     }
 
-    private void confirmUpdate() {
+    // ------------------------------------------------------------- 更新
+
+    private void confirmUpdate(Detection d) {
         final String token = tokenInput.getText().toString().trim();
         final boolean pages = pagesCheck.isChecked();
         final boolean workers = workersCheck.isChecked();
-        final String accountId = accountInput.getText().toString().trim();
         final String project = pagesProjectInput.getText().toString().trim();
         final String script = workerScriptInput.getText().toString().trim();
         final String admin = adminInput.getText().toString();
         final String kvId = kvIdInput.getText().toString().trim();
         final String kvTitle = kvTitleInput.getText().toString().trim();
 
-        if (token.isEmpty()) {
-            toast("请填写 Cloudflare API Token");
-            return;
-        }
-        if (!pages && !workers) {
-            toast("至少选择 Pages 或 Workers");
-            return;
-        }
-        if (accountId.isEmpty()) {
-            toast("请先填写 Account ID，或点击读取账户");
-            return;
-        }
         if (pages && project.isEmpty()) {
-            toast("选择 Pages 后必须填写项目名称");
+            toast("未找到 Pages 项目：请在高级设置中填写项目名");
             return;
         }
         if (workers && script.isEmpty()) {
-            toast("选择 Workers 后必须填写 Script 名称");
-            return;
-        }
-        if (admin.trim().isEmpty()) {
-            toast("EdgeTunnel ADMIN 密码不能为空");
-            return;
-        }
-        if (kvId.isEmpty() && !createKvCheck.isChecked()) {
-            toast("未填写 KV ID 时，请勾选自动复用/创建");
+            toast("未找到 Workers Script：请在高级设置中填写名称");
             return;
         }
 
+        StringBuilder message = new StringBuilder("将从 cmliu/edgetunnel 下载最新 Worker：");
+        if (pages) message.append("\n\nPages → ").append(project);
+        if (workers) message.append("\n\nWorkers → ").append(script);
+        message.append("\n\nKV → ").append(kvId.isEmpty()
+                ? "自动复用/创建（" + (kvTitle.isEmpty() ? "EDT-KV" : kvTitle) + "）" : kvId);
+        message.append("\n\n确认更新？");
+
         new AlertDialog.Builder(this)
                 .setTitle("确认更新")
-                .setMessage("将从 cmliu/edgetunnel 下载最新 Worker，并直接修改你选择的 Cloudflare 部署。"
-                        + (kvId.isEmpty() ? "\nKV ID 为空时可能创建一个新的 KV 命名空间。" : "")
-                        + "\n\n继续吗？")
+                .setMessage(message)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("继续", (dialog, which) -> runUpdate(
-                        token, accountId, project, script, admin, kvId, kvTitle, pages, workers))
+                .setPositiveButton("开始更新", (dialog, which) -> runUpdate(
+                        token, d.accountId, project, script, admin, kvId, kvTitle, pages, workers))
                 .show();
     }
 
     private void runUpdate(String token, String accountId, String project, String script,
                            String admin, String kvId, String kvTitle, boolean pages, boolean workers) {
-        rememberTokenIfRequested(token);
         setBusy(true);
         appendStatus("开始更新……");
         executor.execute(() -> {
@@ -391,7 +421,7 @@ public class MainActivity extends Activity {
 
                 // 兼容性保留：沿用现有脚本的 compatibility_date/flags，读不到才用当天日期
                 String compatDate = "";
-                org.json.JSONArray compatFlags = null;
+                JSONArray compatFlags = null;
                 JSONObject settings = CloudflareApi.getWorkerSettings(accountId, script, token);
                 if (settings != null && !settings.optString("compatibility_date").isEmpty()) {
                     compatDate = settings.optString("compatibility_date");
@@ -435,6 +465,8 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ----------------------------------------------------------- 通用逻辑
+
     private void rememberTokenIfRequested(String token) {
         if (!saveTokenCheck.isChecked()) return;
         try {
@@ -446,10 +478,10 @@ public class MainActivity extends Activity {
 
     private void setBusy(boolean busy) {
         runOnUiThread(() -> {
-            progressBar.setVisibility(busy ? View.VISIBLE : View.GONE);
-            checkButton.setEnabled(!busy);
             updateButton.setEnabled(!busy);
-            clearTokenButton.setEnabled(!busy);
+            updateButton.setText(busy ? "处理中…" : "检测并更新");
+            if (detectOnlyButton != null) detectOnlyButton.setEnabled(!busy);
+            if (clearTokenButton != null) clearTokenButton.setEnabled(!busy);
         });
     }
 
@@ -467,35 +499,84 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> {
             String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
             String old = statusView == null ? "" : statusView.getText().toString();
-            if (old.startsWith("状态日志\n")) old = old.substring("状态日志\n".length());
-            if (old.equals("等待操作。")) old = "";
+            if (old.equals("等待操作。\n") || old.equals("等待操作。")) old = "";
+            if (old.endsWith("\n")) old = old.substring(0, old.length() - 1);
             if (statusView != null) {
-                statusView.setText("状态日志\n" + (old.isEmpty() ? "" : old + "\n")
-                        + "[" + time + "] " + message);
+                statusView.setText((old.isEmpty() ? "" : old + "\n") + "[" + time + "] " + message);
             }
         });
     }
 
-    private TextView section(String value) {
-        TextView view = text(value, 17, Color.rgb(13, 71, 161));
-        view.setTypeface(null, android.graphics.Typeface.BOLD);
+    // ----------------------------------------------------------- 控件工厂
+
+    private LinearLayout card() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.WHITE);
+        bg.setCornerRadius(dp(14));
+        card.setBackground(bg);
+        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        return card;
+    }
+
+    private TextView label(String value) {
+        TextView view = text(value, 13, Color.rgb(70, 84, 100));
+        view.setTypeface(null, Typeface.BOLD);
         return view;
     }
 
-    private EditText field(String hint, boolean password) {
+    private EditText passwordField(String hint) {
+        EditText edit = plainField(hint);
+        edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        return edit;
+    }
+
+    private EditText plainField(String hint) {
         EditText edit = new EditText(this);
         edit.setHint(hint);
         edit.setTextSize(15);
         edit.setSingleLine(true);
-        edit.setPadding(dp(10), dp(8), dp(10), dp(8));
-        if (password) edit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        edit.setBackground(roundStroke());
+        edit.setPadding(dp(10), dp(10), dp(10), dp(10));
         return edit;
     }
 
-    private Button button(String value) {
+    private GradientDrawable roundStroke() {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.rgb(247, 249, 252));
+        bg.setCornerRadius(dp(10));
+        bg.setStroke(dp(1), Color.rgb(215, 224, 235));
+        return bg;
+    }
+
+    private Button primaryButton(String value) {
         Button button = new Button(this);
         button.setText(value);
         button.setAllCaps(false);
+        button.setTextSize(16);
+        button.setTextColor(Color.WHITE);
+        button.setTypeface(null, Typeface.BOLD);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.rgb(21, 101, 192));
+        bg.setCornerRadius(dp(12));
+        button.setBackground(bg);
+        int v = dp(12);
+        button.setPadding(0, v, 0, v);
+        return button;
+    }
+
+    private Button ghostButton(String value) {
+        Button button = new Button(this);
+        button.setText(value);
+        button.setAllCaps(false);
+        button.setTextSize(13);
+        button.setTextColor(Color.rgb(21, 101, 192));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.TRANSPARENT);
+        bg.setCornerRadius(dp(10));
+        bg.setStroke(dp(1), Color.rgb(21, 101, 192));
+        button.setBackground(bg);
         return button;
     }
 
